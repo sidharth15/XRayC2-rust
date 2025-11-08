@@ -6,4 +6,3 @@ pub fn generate_request_id(n: usize) -> String {
     let hex_str = hex::encode(bytes);
     hex_str[..n].to_string()
 }
-
