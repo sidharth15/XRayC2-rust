@@ -3,6 +3,9 @@ use std::collections::HashMap;
 mod model;
 use model::AWSTraceSegment;
 
+mod utils;
+use utils::generate_request_id;
+
 fn main() {
     let mut annotations = HashMap::new();
     annotations.insert("env".to_string(), "dev".to_string());
@@ -16,6 +19,9 @@ fn main() {
         end_time: 2000.0,
         annotations,
     };
+
+    let id = generate_request_id(16);
+    println!("{}", id);
 
     println!("{}", serde_json::to_string_pretty(&segment).unwrap());
 }
