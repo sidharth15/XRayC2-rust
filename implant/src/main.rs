@@ -4,6 +4,7 @@ mod model;
 use model::AWSTraceSegment;
 
 mod utils;
+use utils::compute_hmac_sha256;
 use utils::generate_request_id;
 
 fn main() {
@@ -22,6 +23,13 @@ fn main() {
 
     let id = generate_request_id(16);
     println!("{}", id);
+
+    let key = b"my-secret-key";
+    let data = b"hello world";
+
+    let hmac = compute_hmac_sha256(key, data);
+
+    println!("HMAC (hex): {}", hex::encode(hmac));
 
     println!("{}", serde_json::to_string_pretty(&segment).unwrap());
 }
