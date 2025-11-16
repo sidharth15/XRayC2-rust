@@ -16,6 +16,8 @@ use std::time::Duration; // Dependency for thread-safe global state
 use reqwest::blocking::{Client, Request};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
 
+use std::process::Command;
+
 // --- Helper functions (Ported from Go) ---
 
 fn thread_rng() -> ThreadRng {
@@ -354,4 +356,77 @@ pub fn publish_metrics(
     }
 
     Ok(())
+}
+
+use tracing; // We keep tracing for internal logging
+
+/// Executes a shell command and returns a single String detailing the outcome.
+///
+/// The output string includes the command's exit status, STDOUT, and STDERR.
+/// If the command fails to even start (e.g., program not found), a failure
+/// report is returned as the string instead of panicking or returning an Error type.
+///
+/// # Arguments
+/// * `command_str` - The full command string to execute (e.g., "ls -l /tmp").
+///
+/// # Returns
+/// A single String containing the complete execution report (success or failure).
+pub fn execute_command(command_str: &str) -> String {
+    // 1. Split the command string into the program and its arguments.
+    let mut parts = command_str.split_whitespace();
+    let program = match parts.next() {
+        Some(p) => p,
+        None => {
+            tracing::error!("Attempted to execute an empty command string.");
+            return format!("EXECUTION FAILURE: Command string was empty.");
+        }
+    };
+    let args: Vec<&str> = parts.collect();
+
+    tracing::info!("Executing command: '{}' with arguments: {:?}", program, args);
+
+    // 2. Build and execute the command, handling potential execution errors.
+    let output_result = Command::new(program)
+        .args(args)
+        .output(); // Returns a Result<Output, io::Error>
+
+    // 3. Process the result, turning success or failure into a single report String.
+    match output_result {
+        Ok(output) => {
+            // Command successfully started and finished, now process its exit status and output
+            
+            // Check if the command exited with a success status (exit code 0)
+            let status_code = output.status.code().map_or("N/A".to_string(), |c| c.to_string());
+            let status_label = if output.status.success() {
+                "SUCCESS (Code 0)"
+            } else {
+                "FAILED (Code > 0)"
+            };
+            tracing::info!("Command completed with exit status: {}", status_label);
+
+            // Get stdout and stderr, converting them to UTF-8 lossily
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // 4. Combine and return the structured output.
+            let mut full_output = format!("Status: {}\nExit Code: {}\n", status_label, status_code);
+            
+            // Append STDOUT
+            full_output.push_str("--- STDOUT ---\n");
+            full_output.push_str(stdout.as_ref());
+            
+            // Append STDERR
+            full_output.push_str("\n--- STDERR ---\n");
+            full_output.push_str(stderr.as_ref());
+            
+            full_output.push_str("\n----------------\n");
+            
+            full_output
+        }
+        Err(e) => {
+            // Execution failed BEFORE the command could run (e.g., program not found, permission denied)
+            tracing::error!("Failed to start command '{}': {}", program, e);
+            format!("EXECUTION FAILURE: Could not run program '{}'. Error: {}", program, e)
+        }
+    }
 }

